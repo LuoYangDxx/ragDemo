@@ -1,0 +1,10 @@
+# 原有依赖保持不变
+# 新增：
+prometheus-client==0.20.0
+prometheus-fastapi-instrumentator==7.0.0
+psutil==5.9.8
+opentelemetry-api==1.25.0
+opentelemetry-sdk==1.25.0
+opentelemetry-instrumentation-fastapi==0.46b0
+opentelemetry-instrumentation-httpx==0.46b0
+python-json-logger==2.0.7

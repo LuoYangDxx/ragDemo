@@ -1,0 +1,20 @@
+global:
+  scrape_interval: 15s      # 默认采集间隔
+  evaluation_interval: 15s   # 告警规则评估间隔
+
+# 告警规则文件
+rule_files:
+  - "alerts.yml"
+
+scrape_configs:
+  # RAG 应用自身监控
+  - job_name: 'rag-app'
+    static_configs:
+      - targets: ['rag-app:8000']
+    metrics_path: '/metrics'
+    scrape_interval: 5s
+
+  # Prometheus 自监控
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']

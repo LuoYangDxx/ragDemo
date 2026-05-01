@@ -1,0 +1,27 @@
+groups:
+  - name: rag_alerts
+    interval: 30s
+    rules:
+      # 高延迟告警
+      - alert: HighRAGLatency
+        expr: |
+          histogram_quantile(0.99, sum(rate(rag_latency_seconds_bucket[5m])) by (le, model)) > 5
+        for: 2m
+        annotations:
+          summary: "RAG 请求 P99 延迟超过 5 秒"
+
+      # 高错误率告警
+      - alert: HighErrorRate
+        expr: |
+          (sum(rate(rag_requests_total{status="error"}[5m])) / sum(rate(rag_requests_total[5m]))) > 0.05
+        for: 1m
+        annotations:
+          summary: "错误率超过 5%"
+
+      # 低检索质量告警
+      - alert: LowRetrievalQuality
+        expr: |
+          rate(rag_low_relevance_retrievals_total[5m]) > 0.1
+        for: 2m
+        annotations:
+          summary: "低质量检索比例过高（相似度分数低于 0.4）"
