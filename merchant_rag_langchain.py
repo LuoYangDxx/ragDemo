@@ -1,4 +1,8 @@
 # merchant_rag_langchain.py
+import time
+import logging
+from typing import List, Tuple, Optional, Callable
+
 from langchain_core.documents import Document
 from langchain_core.retrievers import BaseRetriever
 from langchain_openai import ChatOpenAI
@@ -18,9 +22,12 @@ from tools.merchant_tools import MerchantTools
 from langchain_wrapper import create_merchant_tools, MilvusRetrieverWrapper, build_rag_chain
 from router import IntentRouter, Intent, ToolCall
 
-import logging
-import time
-from typing import List, Tuple, Optional, Callable
+# 导入监控模块
+from monitoring import (
+    record_rag_request, record_retrieval, record_llm_call,
+    update_system_metrics, tracer, logger as metrics_logger,
+    ACTIVE_REQUESTS
+)
 
 logger = logging.getLogger(__name__)
 
@@ -163,7 +170,10 @@ class EnhancedRetriever(BaseRetriever):
     def _get_relevant_documents(self, query: str) -> List[Document]:
         """
         Main retrieval method called by LangChain.
+        Includes monitoring for retrieval latency, scores, and document count.
         """
+        retrieval_start = time.perf_counter()
+
         # 1. Get candidate documents from pipeline (already includes RRF + reranking)
         candidates_with_scores = self.retrieval_pipeline.get_knowledge_docs_with_scores(
             query, top_k=self.mmr_candidate_k
@@ -176,7 +186,6 @@ class EnhancedRetriever(BaseRetriever):
         deduped_docs = self._deduplicate([doc for doc, _ in filtered])
 
         # 4. Rebuild score list for deduped docs (keeping the highest score per doc if duplicates existed)
-        # Map from doc identifier to (doc, score). Use page_content as fallback key.
         score_map = {}
         for doc, score in filtered:
             key = doc.metadata.get("chunk_id", doc.page_content)
@@ -189,6 +198,23 @@ class EnhancedRetriever(BaseRetriever):
 
         # 6. Token‑aware truncation
         final_docs = self._truncate_context(mmr_selected_docs)
+
+        # ---------- 记录检索指标 ----------
+        retrieval_latency = time.perf_counter() - retrieval_start
+        # 提取 top_k 个相似度分数（用于直方图）
+        top_scores = [score for _, score in candidates_with_scores[:self.final_top_k]]
+        record_retrieval(
+            latency_seconds=retrieval_latency,
+            top_scores=top_scores,
+            docs_count=len(final_docs)
+        )
+        metrics_logger.info(
+            "retrieval_completed",
+            query=query[:100],
+            docs_count=len(final_docs),
+            max_score=max(top_scores) if top_scores else 0,
+            latency_ms=retrieval_latency * 1000
+        )
 
         return final_docs
 
@@ -330,70 +356,114 @@ class MerchantRAGLangChain:
         return None
 
     async def process(self, raw_query: str, session_id: str = "default"):
+        """
+        处理用户查询的主入口。
+        集成 Prometheus 指标：端到端延迟、LLM 调用、错误计数、活跃请求等。
+        """
         start = time.perf_counter()
-        clean_query = self.preprocessor.clean(raw_query)
+        status = "success"
+        model_name = settings.LLM_MODEL
+        input_tokens = output_tokens = 0
+        cached = False
+        tool_used = "unknown"
+        answer = ""
+        sources = []
+        need_human = False
 
-        # L1 缓存检查
-        cache_key = f"{self.tenant_id}:{clean_query}"
-        cached = self.cache.get(cache_key)
-        if cached:
-            from your_response_model import MerchantResponse  # 请根据实际导入
-            return MerchantResponse(
-                answer=cached, sources=[], tool_used="cache",
-                cached=True, latency_ms=(time.perf_counter() - start) * 1000
-            )
+        # 活跃请求数 +1
+        ACTIVE_REQUESTS.inc()
 
-        # ----- 意图路由（可选）：仅用于快速路径（FAQ 精确命中）-----
-        if self.intent_router:
-            tool_call = self.intent_router.route(clean_query, session_id)
-            # 快速路径：FAQ 精确匹配直接返回，不进入 Agent
-            fast_answer = await self._fast_path_response(
-                getattr(tool_call.parameters.get('entities', {}), 'intent', Intent.FALLBACK),
-                clean_query
-            )
-            if fast_answer:
-                final_answer = self._post_process(fast_answer)
-                self.cache.set(cache_key, final_answer)
+        try:
+            clean_query = self.preprocessor.clean(raw_query)
+
+            # L1 缓存检查
+            cache_key = f"{self.tenant_id}:{clean_query}"
+            cached_answer = self.cache.get(cache_key)
+            if cached_answer:
+                cached = True
+                answer = cached_answer
+                tool_used = "cache"
                 latency_ms = (time.perf_counter() - start) * 1000
                 from your_response_model import MerchantResponse
                 return MerchantResponse(
-                    answer=final_answer, sources=[], tool_used="intent_fast_path",
-                    cached=False, latency_ms=latency_ms
+                    answer=answer, sources=[], tool_used=tool_used,
+                    cached=True, latency_ms=latency_ms, need_human=False
                 )
-            # 未命中快速路径，继续走 Agent
 
-        # ----- 常规 Agent 处理（支持 tool calling + RAG 作为工具）-----
-        try:
-            result = await self.agent_executor.ainvoke({
-                "input": clean_query,
-                "chat_history": self.memory.chat_memory.messages
-            })
-            answer = result["output"]
-            # 更新对话记忆
-            self.memory.chat_memory.add_user_message(clean_query)
-            self.memory.chat_memory.add_ai_message(answer)
-            tool_used = "langchain_agent"
-            sources = []
-            need_human = False
+            # ----- 意图路由（可选）：仅用于快速路径（FAQ 精确命中）-----
+            if self.intent_router:
+                tool_call = self.intent_router.route(clean_query, session_id)
+                fast_answer = await self._fast_path_response(
+                    getattr(tool_call.parameters.get('entities', {}), 'intent', Intent.FALLBACK),
+                    clean_query
+                )
+                if fast_answer:
+                    answer = self._post_process(fast_answer)
+                    tool_used = "intent_fast_path"
+                    self.cache.set(cache_key, answer)
+                    latency_ms = (time.perf_counter() - start) * 1000
+                    from your_response_model import MerchantResponse
+                    return MerchantResponse(
+                        answer=answer, sources=[], tool_used=tool_used,
+                        cached=False, latency_ms=latency_ms, need_human=False
+                    )
+
+            # ----- 常规 Agent 处理（支持 tool calling + RAG 作为工具）-----
+            agent_start = time.perf_counter()
+            try:
+                result = await self.agent_executor.ainvoke({
+                    "input": clean_query,
+                    "chat_history": self.memory.chat_memory.messages
+                })
+                agent_latency = time.perf_counter() - agent_start
+                answer = result["output"]
+                # 尝试从 result 中获取 token 用量（LangChain 可能提供）
+                if "usage_metadata" in result:
+                    input_tokens = result["usage_metadata"].get("input_tokens", 0)
+                    output_tokens = result["usage_metadata"].get("output_tokens", 0)
+                # 记录 LLM 指标（Agent 内部可能多次调用，这里粗略记录整次 Agent 调用的耗时和 token）
+                record_llm_call(model_name, agent_latency, input_tokens, output_tokens)
+
+                # 更新对话记忆
+                self.memory.chat_memory.add_user_message(clean_query)
+                self.memory.chat_memory.add_ai_message(answer)
+                tool_used = "langchain_agent"
+                sources = []
+                need_human = False
+            except Exception as e:
+                logger.error(f"Agent execution failed: {e}")
+                # 降级：直接使用 RAG 链（纯检索 + 生成）
+                rag_start = time.perf_counter()
+                answer = await self.rag_chain.ainvoke(clean_query)
+                rag_latency = time.perf_counter() - rag_start
+                # 记录 LLM 调用（降级场景）
+                record_llm_call(model_name, rag_latency, 0, 0)  # token 未知时传 0
+                tool_used = "rag_fallback"
+                sources = []
+                need_human = False
+
+            final_answer = self._post_process(answer)
+            self.cache.set(cache_key, final_answer)
+            answer = final_answer
+
         except Exception as e:
-            logger.error(f"Agent execution failed: {e}")
-            # 降级：直接使用 RAG 链（纯检索 + 生成）
-            answer = await self.rag_chain.ainvoke(clean_query)
-            tool_used = "rag_fallback"
-            sources = []
-            need_human = False
+            status = "error"
+            logger.exception(f"Unexpected error in process: {e}")
+            answer = "抱歉，系统遇到临时问题，请稍后再试。"
+            tool_used = "error"
+        finally:
+            # 记录端到端请求指标
+            total_latency = time.perf_counter() - start
+            record_rag_request(model_name, status, total_latency)
+            ACTIVE_REQUESTS.dec()
 
-        final_answer = self._post_process(answer)
-        self.cache.set(cache_key, final_answer)
-
-        latency_ms = (time.perf_counter() - start) * 1000
         from your_response_model import MerchantResponse
         return MerchantResponse(
-            answer=final_answer,
+            answer=answer,
             sources=sources,
             tool_used=tool_used,
             cached=False,
-            latency_ms=latency_ms,
+            latency_ms=total_latency * 1000,
             need_human=need_human
         )
 
@@ -404,3 +474,4 @@ class MerchantRAGLangChain:
         if hasattr(self, 'cache'):
             await self.cache.close()
         # 如有必要，可添加 Milvus 断开连接等
+        logger.info("MerchantRAGLangChain closed.")
